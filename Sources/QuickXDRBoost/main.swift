@@ -2,8 +2,10 @@ import AppKit
 import CoreGraphics
 import IOKit
 import MetalKit
+import ServiceManagement
 
 private let bundleId = "local.quickxdrboost"
+private let repoURL = URL(string: "https://github.com/madebycm/QuickXDRBoost")!
 private let supportedDevices: Set<String> = [
     "MacBookPro18,1", "MacBookPro18,2", "MacBookPro18,3", "MacBookPro18,4",
     "Mac14,6", "Mac14,10", "Mac14,5", "Mac14,9",
@@ -73,16 +75,20 @@ private final class GammaTable {
         guard result == .success else { return nil }
     }
 
-    func apply(displayId: CGDirectDisplayID, factor: Float) {
+    func apply(displayId: CGDirectDisplayID, boostFactor: Float, whitePointGamma: Double) {
         var r = red
         var g = green
         var b = blue
         for index in r.indices {
-            r[index] *= factor
-            g[index] *= factor
-            b[index] *= factor
+            r[index] = powf(r[index], Float(whitePointGamma)) * boostFactor
+            g[index] = powf(g[index], Float(whitePointGamma)) * boostFactor
+            b[index] = powf(b[index], Float(whitePointGamma)) * boostFactor
         }
         CGSetDisplayTransferByTable(displayId, Self.size, &r, &g, &b)
+    }
+
+    func restore(displayId: CGDirectDisplayID) {
+        apply(displayId: displayId, boostFactor: 1, whitePointGamma: 1)
     }
 }
 
@@ -167,10 +173,30 @@ private final class BoostController {
             refresh()
         }
     }
+    var whitePointEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(whitePointEnabled, forKey: "whitePointEnabled")
+            refresh()
+        }
+    }
+    var whitePointIntensity: Float {
+        didSet {
+            whitePointIntensity = max(0, min(200, whitePointIntensity))
+            UserDefaults.standard.set(whitePointIntensity, forKey: "whitePointIntensity")
+            refresh()
+        }
+    }
 
     init() {
-        let stored = UserDefaults.standard.object(forKey: "brightness") as? Float
-        brightness = stored ?? 1
+        brightness = UserDefaults.standard.object(forKey: "brightness") == nil
+            ? 1
+            : UserDefaults.standard.float(forKey: "brightness")
+        whitePointEnabled = UserDefaults.standard.object(forKey: "whitePointEnabled") == nil
+            ? false
+            : UserDefaults.standard.bool(forKey: "whitePointEnabled")
+        whitePointIntensity = UserDefaults.standard.object(forKey: "whitePointIntensity") == nil
+            ? 100
+            : UserDefaults.standard.float(forKey: "whitePointIntensity")
     }
 
     func start() {
@@ -197,36 +223,58 @@ private final class BoostController {
         return 1 + (refGamma(for: screen) - 1) * min(maxEDR / referenceEDR, brightness)
     }
 
+    private var whitePointGamma: Double {
+        guard whitePointEnabled else { return 1 }
+        return 1 + Double(whitePointIntensity) / 100 * 0.8
+    }
+
     private func refresh() {
         guard enabled else { return }
-        let screens = supportedScreens()
-        let activeIds = Set(screens.compactMap(\.displayId))
+        let xdrScreens = supportedScreens()
+        let xdrIds = Set(xdrScreens.compactMap(\.displayId))
+        let gammaScreens = whitePointEnabled ? NSScreen.screens : xdrScreens
+        let activeIds = Set(gammaScreens.compactMap(\.displayId))
 
-        for id in overlays.keys where !activeIds.contains(id) {
+        for id in overlays.keys where !xdrIds.contains(id) {
             overlays[id]?.window.close()
             overlays.removeValue(forKey: id)
-            baselines[id]?.apply(displayId: id, factor: 1)
+        }
+
+        for id in baselines.keys where !activeIds.contains(id) {
+            baselines[id]?.restore(displayId: id)
             baselines.removeValue(forKey: id)
         }
 
-        for screen in screens {
+        for screen in xdrScreens {
             guard let displayId = screen.displayId else { continue }
             if overlays[displayId] == nil {
                 overlays[displayId] = OverlayController(screen: screen)
-                baselines[displayId] = GammaTable(displayId: displayId)
             } else {
                 overlays[displayId]?.update(screen: screen)
             }
+        }
 
-            if screen.maximumExtendedDynamicRangeColorComponentValue > 1.05 {
-                baselines[displayId]?.apply(displayId: displayId, factor: gammaFactor(screen: screen))
+        for screen in gammaScreens {
+            guard let displayId = screen.displayId else { continue }
+            if baselines[displayId] == nil {
+                baselines[displayId] = GammaTable(displayId: displayId)
             }
+
+            var boostFactor: Float = 1
+            if screen.maximumExtendedDynamicRangeColorComponentValue > 1.05 {
+                boostFactor = xdrIds.contains(displayId) ? gammaFactor(screen: screen) : 1
+            }
+            baselines[displayId]?.apply(
+                displayId: displayId,
+                boostFactor: boostFactor,
+                whitePointGamma: whitePointGamma
+            )
         }
     }
 
     private func restore() {
         for (id, table) in baselines {
-            table.apply(displayId: id, factor: 1)
+            table.restore(displayId: id)
         }
         baselines.removeAll()
         overlays.values.forEach { $0.window.close() }
@@ -235,12 +283,35 @@ private final class BoostController {
     }
 }
 
+private final class LaunchAtLoginController {
+    var isEnabled: Bool {
+        SMAppService.mainApp.status == .enabled
+    }
+
+    func setEnabled(_ enabled: Bool) throws {
+        if enabled {
+            if SMAppService.mainApp.status != .enabled {
+                try SMAppService.mainApp.register()
+            }
+        } else {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            }
+        }
+    }
+}
+
 @MainActor
 private final class MenuController: NSObject, NSApplicationDelegate {
     private let boost = BoostController()
+    private let launchAtLogin = LaunchAtLoginController()
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    private let valueItem = NSMenuItem()
-    private let slider = NSSlider(value: 1, minValue: 0, maxValue: 100, target: nil, action: nil)
+    private let boostValueItem = NSMenuItem()
+    private let boostSlider = NSSlider(value: 1, minValue: 0, maxValue: 100, target: nil, action: nil)
+    private let whitePointCheckbox = NSButton(checkboxWithTitle: "Reduce white point", target: nil, action: nil)
+    private let whitePointValueItem = NSMenuItem()
+    private let whitePointSlider = NSSlider(value: 100, minValue: 0, maxValue: 200, target: nil, action: nil)
+    private let launchAtLoginCheckbox = NSButton(checkboxWithTitle: "Launch at login", target: nil, action: nil)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -261,22 +332,60 @@ private final class MenuController: NSObject, NSApplicationDelegate {
         }
 
         let menu = NSMenu()
-        valueItem.isEnabled = false
-        menu.addItem(valueItem)
+        boostValueItem.isEnabled = false
+        menu.addItem(boostValueItem)
 
-        slider.target = self
-        slider.action = #selector(sliderChanged(_:))
-        slider.numberOfTickMarks = 5
-        slider.allowsTickMarkValuesOnly = false
-        slider.frame = NSRect(x: 14, y: 8, width: 220, height: 28)
+        boostSlider.target = self
+        boostSlider.action = #selector(boostSliderChanged(_:))
+        boostSlider.numberOfTickMarks = 5
+        boostSlider.allowsTickMarkValuesOnly = false
+        boostSlider.frame = NSRect(x: 14, y: 8, width: 220, height: 28)
 
-        let sliderContainer = NSView(frame: NSRect(x: 0, y: 0, width: 248, height: 44))
-        sliderContainer.addSubview(slider)
-        let sliderItem = NSMenuItem()
-        sliderItem.view = sliderContainer
-        menu.addItem(sliderItem)
+        let boostSliderContainer = NSView(frame: NSRect(x: 0, y: 0, width: 248, height: 44))
+        boostSliderContainer.addSubview(boostSlider)
+        let boostSliderItem = NSMenuItem()
+        boostSliderItem.view = boostSliderContainer
+        menu.addItem(boostSliderItem)
 
         menu.addItem(.separator())
+        whitePointCheckbox.target = self
+        whitePointCheckbox.action = #selector(whitePointCheckboxChanged(_:))
+        whitePointCheckbox.frame = NSRect(x: 14, y: 5, width: 220, height: 24)
+        let whitePointCheckboxContainer = NSView(frame: NSRect(x: 0, y: 0, width: 248, height: 34))
+        whitePointCheckboxContainer.addSubview(whitePointCheckbox)
+        let whitePointCheckboxItem = NSMenuItem()
+        whitePointCheckboxItem.view = whitePointCheckboxContainer
+        menu.addItem(whitePointCheckboxItem)
+
+        whitePointValueItem.isEnabled = false
+        menu.addItem(whitePointValueItem)
+
+        whitePointSlider.target = self
+        whitePointSlider.action = #selector(whitePointSliderChanged(_:))
+        whitePointSlider.numberOfTickMarks = 5
+        whitePointSlider.allowsTickMarkValuesOnly = false
+        whitePointSlider.frame = NSRect(x: 14, y: 8, width: 220, height: 28)
+        let whitePointSliderContainer = NSView(frame: NSRect(x: 0, y: 0, width: 248, height: 44))
+        whitePointSliderContainer.addSubview(whitePointSlider)
+        let whitePointSliderItem = NSMenuItem()
+        whitePointSliderItem.view = whitePointSliderContainer
+        menu.addItem(whitePointSliderItem)
+
+        menu.addItem(.separator())
+        launchAtLoginCheckbox.target = self
+        launchAtLoginCheckbox.action = #selector(launchAtLoginChanged(_:))
+        launchAtLoginCheckbox.frame = NSRect(x: 14, y: 5, width: 220, height: 24)
+        let launchContainer = NSView(frame: NSRect(x: 0, y: 0, width: 248, height: 34))
+        launchContainer.addSubview(launchAtLoginCheckbox)
+        let launchItem = NSMenuItem()
+        launchItem.view = launchContainer
+        menu.addItem(launchItem)
+
+        menu.addItem(.separator())
+        let aboutItem = NSMenuItem(title: "About QuickXDRBoost", action: #selector(showAbout), keyEquivalent: "")
+        aboutItem.target = self
+        menu.addItem(aboutItem)
+
         let quitItem = NSMenuItem(title: "Quit QuickXDRBoost", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
@@ -284,15 +393,61 @@ private final class MenuController: NSObject, NSApplicationDelegate {
     }
 
     private func updateDisplay() {
-        let percent = Int(round(boost.brightness * 100))
-        valueItem.title = "Brightness boost: \(percent)%"
-        slider.doubleValue = Double(percent)
-        statusItem.button?.toolTip = "QuickXDRBoost \(percent)%"
+        let boostPercent = Int(round(boost.brightness * 100))
+        let whitePointPercent = Int(round(boost.whitePointIntensity))
+        boostValueItem.title = "XDR boost: \(boostPercent)%"
+        boostSlider.doubleValue = Double(boostPercent)
+        whitePointCheckbox.state = boost.whitePointEnabled ? .on : .off
+        whitePointValueItem.title = "White point reduction: \(whitePointPercent)%"
+        whitePointSlider.doubleValue = Double(whitePointPercent)
+        whitePointSlider.isEnabled = boost.whitePointEnabled
+        launchAtLoginCheckbox.state = launchAtLogin.isEnabled ? .on : .off
+        statusItem.button?.toolTip = "QuickXDRBoost - XDR \(boostPercent)%, white point \(whitePointPercent)%"
     }
 
-    @objc private func sliderChanged(_ sender: NSSlider) {
+    @objc private func boostSliderChanged(_ sender: NSSlider) {
         boost.brightness = Float(sender.doubleValue / 100)
         updateDisplay()
+    }
+
+    @objc private func whitePointCheckboxChanged(_ sender: NSButton) {
+        boost.whitePointEnabled = sender.state == .on
+        updateDisplay()
+    }
+
+    @objc private func whitePointSliderChanged(_ sender: NSSlider) {
+        boost.whitePointIntensity = Float(sender.doubleValue)
+        updateDisplay()
+    }
+
+    @objc private func launchAtLoginChanged(_ sender: NSButton) {
+        do {
+            try launchAtLogin.setEnabled(sender.state == .on)
+        } catch {
+            sender.state = launchAtLogin.isEnabled ? .on : .off
+            let alert = NSAlert()
+            alert.messageText = "Could not update launch at login"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
+        updateDisplay()
+    }
+
+    @objc private func showAbout() {
+        let alert = NSAlert()
+        alert.messageText = "QuickXDRBoost"
+        alert.informativeText = """
+        XDR brightness boost for the macOS menu bar.
+
+        Made by madebycm.
+        \(repoURL.absoluteString)
+        """
+        alert.addButton(withTitle: "Open GitHub")
+        alert.addButton(withTitle: "OK")
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(repoURL)
+        }
     }
 
     @objc private func quit() {

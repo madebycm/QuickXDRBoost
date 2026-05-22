@@ -19,6 +19,7 @@ $(APP_DIR): $(SRC) AppBundle/Contents/Info.plist
 		-framework CoreGraphics \
 		-framework IOKit \
 		-framework MetalKit \
+		-framework ServiceManagement \
 		-o $(BIN)
 	codesign --force --deep --sign - $(APP_DIR)
 
