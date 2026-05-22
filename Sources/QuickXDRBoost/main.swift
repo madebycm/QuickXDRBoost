@@ -160,10 +160,33 @@ private final class OverlayController {
     }
 }
 
+private struct DisplayGammaTarget {
+    var boostFactor: Float
+    var whitePointGamma: Double
+
+    static let identity = DisplayGammaTarget(boostFactor: 1, whitePointGamma: 1)
+
+    func isClose(to other: DisplayGammaTarget) -> Bool {
+        abs(boostFactor - other.boostFactor) < 0.002 && abs(whitePointGamma - other.whitePointGamma) < 0.002
+    }
+
+    func interpolated(to target: DisplayGammaTarget, progress: Double) -> DisplayGammaTarget {
+        let clampedProgress = max(0, min(1, progress))
+        let eased = clampedProgress * clampedProgress * (3 - 2 * clampedProgress)
+        return DisplayGammaTarget(
+            boostFactor: boostFactor + (target.boostFactor - boostFactor) * Float(eased),
+            whitePointGamma: whitePointGamma + (target.whitePointGamma - whitePointGamma) * eased
+        )
+    }
+}
+
 @MainActor
 private final class BoostController {
     private var overlays: [CGDirectDisplayID: OverlayController] = [:]
     private var baselines: [CGDirectDisplayID: GammaTable] = [:]
+    private var appliedTargets: [CGDirectDisplayID: DisplayGammaTarget] = [:]
+    private var pendingTargets: [CGDirectDisplayID: DisplayGammaTarget] = [:]
+    private var animationTasks: [CGDirectDisplayID: Task<Void, Never>] = [:]
     private var timer: Timer?
     private var enabled = true
     var brightness: Float {
@@ -235,14 +258,18 @@ private final class BoostController {
         let gammaScreens = whitePointEnabled ? NSScreen.screens : xdrScreens
         let activeIds = Set(gammaScreens.compactMap(\.displayId))
 
-        for id in overlays.keys where !xdrIds.contains(id) {
+        for id in Array(overlays.keys) where !xdrIds.contains(id) {
             overlays[id]?.window.close()
             overlays.removeValue(forKey: id)
         }
 
-        for id in baselines.keys where !activeIds.contains(id) {
+        for id in Array(baselines.keys) where !activeIds.contains(id) {
+            animationTasks[id]?.cancel()
+            animationTasks.removeValue(forKey: id)
             baselines[id]?.restore(displayId: id)
             baselines.removeValue(forKey: id)
+            appliedTargets.removeValue(forKey: id)
+            pendingTargets.removeValue(forKey: id)
         }
 
         for screen in xdrScreens {
@@ -264,15 +291,71 @@ private final class BoostController {
             if screen.maximumExtendedDynamicRangeColorComponentValue > 1.05 {
                 boostFactor = xdrIds.contains(displayId) ? gammaFactor(screen: screen) : 1
             }
-            baselines[displayId]?.apply(
+            applySmoothly(
                 displayId: displayId,
-                boostFactor: boostFactor,
-                whitePointGamma: whitePointGamma
+                target: DisplayGammaTarget(boostFactor: boostFactor, whitePointGamma: whitePointGamma)
             )
         }
     }
 
+    private func applySmoothly(displayId: CGDirectDisplayID, target: DisplayGammaTarget) {
+        guard let table = baselines[displayId] else { return }
+        if pendingTargets[displayId]?.isClose(to: target) == true {
+            return
+        }
+
+        let start = appliedTargets[displayId] ?? .identity
+        pendingTargets[displayId] = target
+        animationTasks[displayId]?.cancel()
+
+        if start.isClose(to: target) {
+            table.apply(
+                displayId: displayId,
+                boostFactor: target.boostFactor,
+                whitePointGamma: target.whitePointGamma
+            )
+            appliedTargets[displayId] = target
+            return
+        }
+
+        animationTasks[displayId] = Task { @MainActor in
+            let duration: Double = 0.22
+            let frameInterval: UInt64 = 1_000_000_000 / 60
+            let startTime = Date()
+
+            while !Task.isCancelled {
+                let progress = Date().timeIntervalSince(startTime) / duration
+                let current = start.interpolated(to: target, progress: progress)
+                table.apply(
+                    displayId: displayId,
+                    boostFactor: current.boostFactor,
+                    whitePointGamma: current.whitePointGamma
+                )
+                appliedTargets[displayId] = current
+
+                if progress >= 1 {
+                    break
+                }
+                try? await Task.sleep(nanoseconds: frameInterval)
+            }
+
+            guard !Task.isCancelled else { return }
+            table.apply(
+                displayId: displayId,
+                boostFactor: target.boostFactor,
+                whitePointGamma: target.whitePointGamma
+            )
+            appliedTargets[displayId] = target
+            pendingTargets[displayId] = target
+            animationTasks.removeValue(forKey: displayId)
+        }
+    }
+
     private func restore() {
+        animationTasks.values.forEach { $0.cancel() }
+        animationTasks.removeAll()
+        appliedTargets.removeAll()
+        pendingTargets.removeAll()
         for (id, table) in baselines {
             table.restore(displayId: id)
         }
